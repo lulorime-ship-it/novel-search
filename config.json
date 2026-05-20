@@ -1,10 +1,14 @@
 {
-    "language": "en",
+    "language": "zh",
     "search_engine": "bing",
     "output_dir": "downloads",
     "concurrency": 5,
     "delay": 0.5,
     "similarity": 0.85,
     "min_para_len": 50,
-    "dark_mode": true
+    "dark_mode": true,
+    "search_history": [
+        "青山"
+    ],
+    "favorites": []
 }

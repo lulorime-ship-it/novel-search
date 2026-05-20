@@ -12,13 +12,21 @@ from PySide6.QtWidgets import (
     QSplitter, QHeaderView, QMessageBox, QFileDialog,
     QSpinBox, QDoubleSpinBox, QFormLayout, QGroupBox,
     QListWidget, QListWidgetItem, QAbstractItemView,
-    QComboBox, QDialog, QScrollArea, QGridLayout,
+    QComboBox, QDialog, QScrollArea, QGridLayout, QCheckBox,
+    QSlider, QDialogButtonBox,
 )
-from PySide6.QtCore import Qt, QTimer, Slot, QSize, QThreadPool
+from PySide6.QtCore import Qt, QTimer, Slot, QSize, QThreadPool, QUrl, Signal
 from PySide6.QtGui import QFont, QIcon, QColor, QPixmap
 
 from sources.base import SearchResult, NovelInfo, ChapterInfo
+from sources.generic import GenericSource
 from engine.cleaner import NovelCleaner
+from engine.novel_processor import NovelProcessor
+from engine.exporter import export_epub, export_html
+from engine.bookshelf import BookshelfManager, TAG_CATEGORIES
+from engine.tts_player import TTSPlayer
+from engine.updater import UpdateChecker
+from engine.plugin_manager import PluginManager
 from gui.worker import NovelWorker
 from gui.styles import STYLE_QSS
 
@@ -87,6 +95,7 @@ SEARCH_ENGINE_RESULT_SELECTORS = {
 CONFIG_KEYS = [
     'language', 'search_engine', 'output_dir',
     'concurrency', 'delay', 'similarity', 'min_para_len', 'dark_mode',
+    'search_history', 'favorites',
 ]
 
 
@@ -101,6 +110,8 @@ def load_config() -> dict:
         'similarity': 0.85,
         'min_para_len': 50,
         'dark_mode': True,
+        'search_history': [],
+        'favorites': [],
     }
     for k, v in defaults.items():
         if k not in data:
@@ -148,6 +159,31 @@ class LanguageManager:
 LM = LanguageManager.instance()
 
 
+class BookshelfDropList(QListWidget):
+
+    file_dropped = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                fp = url.toLocalFile()
+                if fp.lower().endswith(('.txt', '.epub')):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            fp = url.toLocalFile()
+            if fp.lower().endswith(('.txt', '.epub')):
+                self.file_dropped.emit(fp)
+
+
 class MainWindow(QMainWindow):
 
     def __init__(self):
@@ -166,9 +202,17 @@ class MainWindow(QMainWindow):
         self._lang_combo: QComboBox | None = None
         self._engine_combo: QComboBox | None = None
 
+        self._bookshelf = BookshelfManager()
+        self._tts_player = TTSPlayer(self)
+        self._tts_player.state_changed.connect(self._on_tts_state_changed)
+        self._plugin_manager = PluginManager()
+        self._update_checker = UpdateChecker()
+
         self._setup_ui()
         self._connect_signals()
         self._load_settings_into_ui()
+        self._refresh_favorites_list()
+        self._refresh_history_combo()
 
     def _setup_ui(self):
         central = QWidget()
@@ -208,11 +252,19 @@ class MainWindow(QMainWindow):
         self._settings_tab = self._create_settings_tab()
         self._tab_widget.addTab(self._settings_tab, LM.t('tab_settings'))
 
+        self._bookshelf_tab = self._create_bookshelf_tab()
+        self._tab_widget.addTab(self._bookshelf_tab, LM.t('tab_bookshelf'))
+
+        self._plugin_tab = self._create_plugin_tab()
+        self._tab_widget.addTab(self._plugin_tab, LM.t('tab_plugins'))
+
         main_layout.addWidget(self._tab_widget)
 
         self._status_label = QLabel(LM.t('status_ready'))
         self._status_label.setStyleSheet('color: #a6adc8; padding: 4px; font-size: 12px;')
         main_layout.addWidget(self._status_label)
+
+        QTimer.singleShot(2000, self._check_for_updates)
 
     def _create_search_tab(self) -> QWidget:
         tab = QWidget()
@@ -222,8 +274,16 @@ class MainWindow(QMainWindow):
         search_layout = QHBoxLayout()
         self._search_input = QLineEdit()
         self._search_input.setPlaceholderText(LM.t('search_placeholder'))
-        self._search_input.setMinimumHeight(36)
         self._search_input.returnPressed.connect(self._on_search)
+        self._search_input.setMinimumHeight(36)
+
+        self._history_combo = QComboBox()
+        self._history_combo.setMinimumHeight(36)
+        self._history_combo.setEditable(False)
+        self._history_combo.setMinimumWidth(40)
+        self._history_combo.currentTextChanged.connect(self._on_history_selected)
+        search_layout.addWidget(self._history_combo)
+
         search_layout.addWidget(self._search_input, 3)
 
         self._search_btn = QPushButton(LM.t('search_btn'))
@@ -278,13 +338,45 @@ class MainWindow(QMainWindow):
         self._fetch_info_btn.clicked.connect(self._on_fetch_info)
         btn_layout.addWidget(self._fetch_info_btn)
         btn_layout.addStretch()
+
+        self._fav_btn = QPushButton(LM.t('fav_add_btn'))
+        self._fav_btn.setObjectName('searchBtn')
+        self._fav_btn.clicked.connect(self._on_add_favorite)
+        btn_layout.addWidget(self._fav_btn)
         layout.addLayout(btn_layout)
 
+        bottom_split = QHBoxLayout()
+        bottom_split.setSpacing(8)
+
+        info_col = QVBoxLayout()
         self._info_display = QTextEdit()
         self._info_display.setReadOnly(True)
-        self._info_display.setMaximumHeight(150)
         self._info_display.setPlaceholderText(LM.t('fetch_info_hint'))
-        layout.addWidget(self._info_display)
+        info_col.addWidget(self._info_display)
+        bottom_split.addLayout(info_col, 1)
+
+        fav_col = QVBoxLayout()
+        fav_header = QHBoxLayout()
+        fav_header.addWidget(QLabel(LM.t('favorites_label')))
+
+        self._fav_remove_btn = QPushButton(LM.t('fav_remove_btn'))
+        self._fav_remove_btn.setFixedWidth(80)
+        self._fav_remove_btn.clicked.connect(self._on_remove_favorite)
+        fav_header.addWidget(self._fav_remove_btn)
+
+        self._fav_open_btn = QPushButton(LM.t('fav_open_btn'))
+        self._fav_open_btn.setFixedWidth(80)
+        self._fav_open_btn.setObjectName('searchBtn')
+        self._fav_open_btn.clicked.connect(self._on_open_favorite)
+        fav_header.addWidget(self._fav_open_btn)
+        fav_col.addLayout(fav_header)
+
+        self._fav_list = QListWidget()
+        self._fav_list.doubleClicked.connect(self._on_open_favorite)
+        fav_col.addWidget(self._fav_list)
+        bottom_split.addLayout(fav_col, 1)
+
+        layout.addLayout(bottom_split)
 
         return tab
 
@@ -334,6 +426,21 @@ class MainWindow(QMainWindow):
 
         chapter_select_layout.addStretch()
 
+        self._sel_all_btn = QPushButton(LM.t('select_all_btn'))
+        self._sel_all_btn.setFixedWidth(70)
+        self._sel_all_btn.clicked.connect(lambda: self._select_chapters(True))
+        chapter_select_layout.addWidget(self._sel_all_btn)
+
+        self._sel_none_btn = QPushButton(LM.t('select_none_btn'))
+        self._sel_none_btn.setFixedWidth(70)
+        self._sel_none_btn.clicked.connect(lambda: self._select_chapters(False))
+        chapter_select_layout.addWidget(self._sel_none_btn)
+
+        self._sel_invert_btn = QPushButton(LM.t('select_invert_btn'))
+        self._sel_invert_btn.setFixedWidth(70)
+        self._sel_invert_btn.clicked.connect(self._invert_chapters)
+        chapter_select_layout.addWidget(self._sel_invert_btn)
+
         self._download_btn = QPushButton(LM.t('download_btn'))
         self._download_btn.setObjectName('downloadBtn')
         self._download_btn.setMinimumHeight(36)
@@ -378,8 +485,8 @@ class MainWindow(QMainWindow):
 
     def _create_preview_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setSpacing(8)
+        outer = QVBoxLayout(tab)
+        outer.setSpacing(8)
 
         toolbar = QHBoxLayout()
         self._preview_info_label = QLabel(LM.t('preview_info_placeholder'))
@@ -393,13 +500,133 @@ class MainWindow(QMainWindow):
         self._refresh_btn = QPushButton(LM.t('refresh_btn'))
         self._refresh_btn.clicked.connect(self._on_refresh_preview)
         toolbar.addWidget(self._refresh_btn)
-        layout.addLayout(toolbar)
+
+        self._export_epub_btn = QPushButton(LM.t('export_epub_btn'))
+        self._export_epub_btn.clicked.connect(self._on_export_epub)
+        toolbar.addWidget(self._export_epub_btn)
+
+        self._export_html_btn = QPushButton(LM.t('export_html_btn'))
+        self._export_html_btn.clicked.connect(self._on_export_html)
+        toolbar.addWidget(self._export_html_btn)
+        outer.addLayout(toolbar)
+
+        tts_layout = QHBoxLayout()
+        self._tts_play_btn = QPushButton(LM.t('tts_play'))
+        self._tts_play_btn.setObjectName('searchBtn')
+        self._tts_play_btn.setFixedWidth(60)
+        self._tts_play_btn.clicked.connect(self._on_tts_play)
+        tts_layout.addWidget(self._tts_play_btn)
+
+        self._tts_pause_btn = QPushButton(LM.t('tts_pause'))
+        self._tts_pause_btn.setFixedWidth(60)
+        self._tts_pause_btn.clicked.connect(self._on_tts_pause)
+        tts_layout.addWidget(self._tts_pause_btn)
+
+        self._tts_stop_btn = QPushButton(LM.t('tts_stop'))
+        self._tts_stop_btn.setFixedWidth(60)
+        self._tts_stop_btn.clicked.connect(self._on_tts_stop)
+        tts_layout.addWidget(self._tts_stop_btn)
+
+        tts_layout.addWidget(QLabel(LM.t('tts_rate')))
+        self._tts_rate_slider = QSlider(Qt.Orientation.Horizontal)
+        self._tts_rate_slider.setRange(-10, 10)
+        self._tts_rate_slider.setValue(0)
+        self._tts_rate_slider.setFixedWidth(100)
+        self._tts_rate_slider.valueChanged.connect(self._on_tts_rate_changed)
+        tts_layout.addWidget(self._tts_rate_slider)
+
+        tts_layout.addWidget(QLabel(LM.t('tts_pitch')))
+        self._tts_pitch_slider = QSlider(Qt.Orientation.Horizontal)
+        self._tts_pitch_slider.setRange(-10, 10)
+        self._tts_pitch_slider.setValue(0)
+        self._tts_pitch_slider.setFixedWidth(100)
+        self._tts_pitch_slider.valueChanged.connect(self._on_tts_pitch_changed)
+        tts_layout.addWidget(self._tts_pitch_slider)
+
+        tts_layout.addWidget(QLabel(LM.t('tts_volume')))
+        self._tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self._tts_volume_slider.setRange(0, 10)
+        self._tts_volume_slider.setValue(10)
+        self._tts_volume_slider.setFixedWidth(100)
+        self._tts_volume_slider.valueChanged.connect(self._on_tts_volume_changed)
+        tts_layout.addWidget(self._tts_volume_slider)
+
+        self._tts_status_label = QLabel('')
+        self._tts_status_label.setStyleSheet('color: #a6e3a1; font-size: 12px;')
+        tts_layout.addWidget(self._tts_status_label)
+        tts_layout.addStretch()
+        outer.addLayout(tts_layout)
 
         self._preview_edit = QPlainTextEdit()
         self._preview_edit.setReadOnly(True)
         self._preview_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self._preview_edit.setPlaceholderText(LM.t('preview_placeholder'))
-        layout.addWidget(self._preview_edit, 1)
+        outer.addWidget(self._preview_edit, 1)
+
+        proc_group = QGroupBox(LM.t('processor_group'))
+        proc_layout = QVBoxLayout(proc_group)
+        proc_layout.setSpacing(6)
+
+        check_layout = QHBoxLayout()
+        self._proc_dedup_cb = QCheckBox(LM.t('processor_dedup'))
+        self._proc_dedup_cb.setChecked(True)
+        check_layout.addWidget(self._proc_dedup_cb)
+
+        self._proc_ads_cb = QCheckBox(LM.t('processor_ads'))
+        self._proc_ads_cb.setChecked(True)
+        check_layout.addWidget(self._proc_ads_cb)
+
+        self._proc_format_cb = QCheckBox(LM.t('processor_format'))
+        self._proc_format_cb.setChecked(True)
+        check_layout.addWidget(self._proc_format_cb)
+
+        self._proc_layout_cb = QCheckBox(LM.t('processor_layout'))
+        self._proc_layout_cb.setChecked(True)
+        check_layout.addWidget(self._proc_layout_cb)
+
+        self._proc_stats_label = QLabel('')
+        self._proc_stats_label.setStyleSheet('color: #a6e3a1; font-size: 12px;')
+        check_layout.addWidget(self._proc_stats_label)
+        check_layout.addStretch()
+
+        proc_layout.addLayout(check_layout)
+
+        kw_layout = QHBoxLayout()
+        kw_layout.addWidget(QLabel('  '))
+        self._proc_kw_edit = QLineEdit()
+        self._proc_kw_edit.setPlaceholderText(LM.t('processor_delete_kw'))
+        self._proc_kw_edit.setToolTip(LM.t('processor_delete_kw'))
+        kw_layout.addWidget(self._proc_kw_edit, 1)
+
+        self._proc_kw_mode = QComboBox()
+        self._proc_kw_mode.addItem(LM.t('processor_del_line'), 'line')
+        self._proc_kw_mode.addItem(LM.t('processor_del_sentence'), 'sentence')
+        self._proc_kw_mode.addItem(LM.t('processor_del_keyword'), 'keyword')
+        kw_layout.addWidget(self._proc_kw_mode)
+
+        proc_layout.addLayout(kw_layout)
+
+        self._proc_undo_btn = QPushButton(LM.t('processor_undo'))
+        self._proc_undo_btn.setEnabled(False)
+        self._proc_undo_btn.clicked.connect(self._on_undo_process)
+        check_layout.addWidget(self._proc_undo_btn)
+
+        self._proc_run_btn = QPushButton(LM.t('processor_run'))
+        self._proc_run_btn.setObjectName('downloadBtn')
+        self._proc_run_btn.clicked.connect(self._on_process)
+        check_layout.addWidget(self._proc_run_btn)
+
+        self._proc_save_btn = QPushButton(LM.t('processor_save'))
+        self._proc_save_btn.setObjectName('searchBtn')
+        self._proc_save_btn.setEnabled(False)
+        self._proc_save_btn.clicked.connect(self._on_save_processed)
+        check_layout.addWidget(self._proc_save_btn)
+
+        proc_layout.addLayout(check_layout)
+        outer.addWidget(proc_group)
+
+        self._original_full_text = ''
+        self._processed_full_text = ''
 
         return tab
 
@@ -480,6 +707,17 @@ class MainWindow(QMainWindow):
         author_layout.addWidget(QLabel(f"{LM.t('settings_email')} lorime@126.com"))
         content_layout.addWidget(group3)
 
+        update_group = QGroupBox(LM.t('settings_update'))
+        update_layout = QVBoxLayout(update_group)
+        self._update_status_label = QLabel(LM.t('update_current', version=UpdateChecker.CURRENT_VERSION))
+        self._update_status_label.setStyleSheet('color: #a6adc8;')
+        update_layout.addWidget(self._update_status_label)
+        self._update_check_btn = QPushButton(LM.t('update_check_btn'))
+        self._update_check_btn.setObjectName('searchBtn')
+        self._update_check_btn.clicked.connect(self._on_check_update_clicked)
+        update_layout.addWidget(self._update_check_btn)
+        content_layout.addWidget(update_group)
+
         group4 = QGroupBox(LM.t('settings_donate'))
         donate_layout = QVBoxLayout(group4)
         donate_layout.addWidget(QLabel(LM.t('settings_donate_desc')))
@@ -540,6 +778,73 @@ class MainWindow(QMainWindow):
 
         self._settings_scroll.setWidget(content)
 
+    def _create_bookshelf_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(8)
+
+        toolbar = QHBoxLayout()
+        self._bs_tag_combo = QComboBox()
+        self._bs_tag_combo.addItem(LM.t('bs_tag_all'), '全部')
+        for tag in TAG_CATEGORIES:
+            self._bs_tag_combo.addItem(tag, tag)
+        self._bs_tag_combo.currentIndexChanged.connect(self._on_bs_tag_changed)
+        toolbar.addWidget(QLabel(LM.t('bs_tag_label')))
+        toolbar.addWidget(self._bs_tag_combo)
+
+        toolbar.addStretch()
+
+        self._bs_add_btn = QPushButton(LM.t('bs_add_btn'))
+        self._bs_add_btn.setObjectName('searchBtn')
+        self._bs_add_btn.clicked.connect(self._on_bs_add_file)
+        toolbar.addWidget(self._bs_add_btn)
+
+        self._bs_remove_btn = QPushButton(LM.t('bs_remove_btn'))
+        self._bs_remove_btn.clicked.connect(self._on_bs_remove)
+        toolbar.addWidget(self._bs_remove_btn)
+
+        self._bs_open_btn = QPushButton(LM.t('bs_open_btn'))
+        self._bs_open_btn.setObjectName('downloadBtn')
+        self._bs_open_btn.clicked.connect(self._on_bs_open)
+        toolbar.addWidget(self._bs_open_btn)
+        layout.addLayout(toolbar)
+
+        self._bs_list = BookshelfDropList()
+        self._bs_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._bs_list.file_dropped.connect(self._on_bs_file_dropped)
+        self._bs_list.doubleClicked.connect(self._on_bs_open)
+        layout.addWidget(self._bs_list, 1)
+
+        self._refresh_bookshelf()
+        return tab
+
+    def _create_plugin_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(8)
+
+        toolbar = QHBoxLayout()
+        self._pl_install_btn = QPushButton(LM.t('pl_install'))
+        self._pl_install_btn.setObjectName('searchBtn')
+        self._pl_install_btn.clicked.connect(self._on_pl_install)
+        toolbar.addWidget(self._pl_install_btn)
+
+        self._pl_remove_btn = QPushButton(LM.t('pl_remove'))
+        self._pl_remove_btn.clicked.connect(self._on_pl_remove)
+        toolbar.addWidget(self._pl_remove_btn)
+
+        self._pl_create_sample_btn = QPushButton(LM.t('pl_create_sample'))
+        self._pl_create_sample_btn.clicked.connect(self._on_pl_create_sample)
+        toolbar.addWidget(self._pl_create_sample_btn)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self._pl_list = QListWidget()
+        layout.addWidget(self._pl_list, 1)
+
+        self._refresh_plugins()
+        return tab
+
     def _rebuild_ui(self):
         self.setWindowTitle(LM.t('app_title'))
         self._title_label.setText(LM.t('header_title'))
@@ -547,6 +852,8 @@ class MainWindow(QMainWindow):
         self._tab_widget.setTabText(1, LM.t('tab_download'))
         self._tab_widget.setTabText(2, LM.t('tab_preview'))
         self._tab_widget.setTabText(3, LM.t('tab_settings'))
+        self._tab_widget.setTabText(4, LM.t('tab_bookshelf'))
+        self._tab_widget.setTabText(5, LM.t('tab_plugins'))
         self._theme_btn.setText(LM.t('theme_btn'))
         self._about_btn.setText(LM.t('about_btn'))
 
@@ -562,9 +869,15 @@ class MainWindow(QMainWindow):
 
         self._fetch_info_btn.setText(LM.t('fetch_info_btn'))
         self._info_display.setPlaceholderText(LM.t('fetch_info_hint'))
+        self._fav_btn.setText(LM.t('fav_add_btn'))
+        self._fav_remove_btn.setText(LM.t('fav_remove_btn'))
+        self._fav_open_btn.setText(LM.t('fav_open_btn'))
 
         self._dl_novel_label.setText(LM.t('no_novel_selected'))
         self._progress_label.setText(LM.t('wait_download'))
+        self._sel_all_btn.setText(LM.t('select_all_btn'))
+        self._sel_none_btn.setText(LM.t('select_none_btn'))
+        self._sel_invert_btn.setText(LM.t('select_invert_btn'))
         self._download_btn.setText(LM.t('download_btn'))
         self._stop_btn.setText(LM.t('stop_btn'))
         self._retry_btn.setText(LM.t('retry_btn'))
@@ -574,6 +887,33 @@ class MainWindow(QMainWindow):
         self._preview_edit.setPlaceholderText(LM.t('preview_placeholder'))
         self._open_file_btn.setText(LM.t('open_file_btn'))
         self._refresh_btn.setText(LM.t('refresh_btn'))
+        self._export_epub_btn.setText(LM.t('export_epub_btn'))
+        self._export_html_btn.setText(LM.t('export_html_btn'))
+
+        self._proc_dedup_cb.setText(LM.t('processor_dedup'))
+        self._proc_ads_cb.setText(LM.t('processor_ads'))
+        self._proc_format_cb.setText(LM.t('processor_format'))
+        self._proc_layout_cb.setText(LM.t('processor_layout'))
+        self._proc_undo_btn.setText(LM.t('processor_undo'))
+        self._proc_run_btn.setText(LM.t('processor_run'))
+        self._proc_save_btn.setText(LM.t('processor_save'))
+        self._proc_kw_edit.setPlaceholderText(LM.t('processor_delete_kw'))
+        self._proc_kw_edit.setToolTip(LM.t('processor_delete_kw'))
+
+        if hasattr(self, '_proc_kw_mode'):
+            current = self._proc_kw_mode.currentData()
+            self._proc_kw_mode.clear()
+            self._proc_kw_mode.addItem(LM.t('processor_del_line'), 'line')
+            self._proc_kw_mode.addItem(LM.t('processor_del_sentence'), 'sentence')
+            self._proc_kw_mode.addItem(LM.t('processor_del_keyword'), 'keyword')
+            idx = self._proc_kw_mode.findData(current)
+            if idx >= 0:
+                self._proc_kw_mode.setCurrentIndex(idx)
+
+        for grp in self._preview_tab.findChildren(QGroupBox):
+            if LM.t('processor_group') in grp.title():
+                grp.setTitle(LM.t('processor_group'))
+                break
 
         old_engine = self._get_engine_code()
         old_lang = self._get_lang_code()
@@ -646,6 +986,7 @@ class MainWindow(QMainWindow):
         w.redownload_finished.connect(self._on_redownload_finished)
         w.download_error.connect(self._on_download_error)
         w.download_cancelled.connect(self._on_download_cancelled)
+        w.checkpoint_available.connect(self._on_checkpoint_available)
         w.compose_finished.connect(self._on_compose_finished)
         w.compose_error.connect(self._on_compose_error)
 
@@ -663,6 +1004,13 @@ class MainWindow(QMainWindow):
         engine_code = self._get_engine_code()
         engine_name = LM.t_engines().get(engine_code, engine_code)
         self._status_label.setText(LM.t('searching_engine', keyword=keyword))
+
+        history = self._config.get('search_history', [])
+        if keyword not in history:
+            history.insert(0, keyword)
+            self._config['search_history'] = history[:50]
+            save_config(self._config)
+
         self._worker._emit_log(LM.t('searching_log', engine=engine_name, keyword=keyword))
         self._worker.search(keyword, engine_code)
 
@@ -766,6 +1114,8 @@ class MainWindow(QMainWindow):
         for ch in info.chapters:
             item = QListWidgetItem(f'[{ch.index + 1}] {ch.title}')
             item.setData(Qt.ItemDataRole.UserRole, ch)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
             self._chapter_listwidget.addItem(item)
 
         self._chapter_end.setMaximum(len(info.chapters))
@@ -792,7 +1142,14 @@ class MainWindow(QMainWindow):
         if start >= end:
             QMessageBox.warning(self, LM.t('msg_title_hint'), LM.t('msg_chapter_range_invalid'))
             return
-        selected = chapters[start:end]
+        selected = []
+        for i in range(self._chapter_listwidget.count()):
+            item = self._chapter_listwidget.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                ch = item.data(Qt.ItemDataRole.UserRole)
+                if ch:
+                    if start <= ch.index < end:
+                        selected.append(ch)
 
         self._download_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -811,7 +1168,8 @@ class MainWindow(QMainWindow):
             delay = self._delay_spin.value()
             self._worker._crawler = NovelCrawler(source=source, concurrency=concurrency, delay=delay)
         self._status_label.setText(LM.t('downloading_status', count=len(selected)))
-        self._worker.download_chapters(selected)
+        output_dir = self._output_dir_edit.text().strip() or 'downloads'
+        self._worker.download_chapters(selected, output_dir)
 
     @Slot(int, int, str)
     def _on_download_progress(self, completed: int, total: int, chapter_title: str):
@@ -877,6 +1235,12 @@ class MainWindow(QMainWindow):
     def _on_download_cancelled(self):
         self._download_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+
+    @Slot(int, int, int)
+    def _on_checkpoint_available(self, done: int, failed: int, pending: int):
+        total = done + failed + pending
+        msg = LM.t('checkpoint_found', done=done, total=total, failed=failed, pending=pending)
+        self._progress_label.setText(msg)
 
     @Slot()
     def _on_stop(self):
@@ -972,12 +1336,70 @@ class MainWindow(QMainWindow):
         self._status_label.setText(LM.t('compose_fail_status', error=error))
 
     def _load_preview(self, filepath: str):
+        self._preview_chunk_pos = 0
+        self._preview_chunk_total = 0
+        self._preview_filepath = filepath
+        try:
+            self._preview_file_size = os.path.getsize(filepath)
+        except OSError:
+            self._preview_file_size = 0
+        CHUNK = 100000
+        INITIAL = CHUNK * 2
+        if self._preview_file_size <= INITIAL:
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    self._preview_edit.setPlainText(f.read())
+            except Exception as e:
+                self._preview_edit.setPlainText(LM.t('preview_load_fail', error=str(e)))
+            self._preview_info_label.setText(
+                LM.t('preview_file_label', title=os.path.basename(filepath), filepath=filepath)
+            )
+            return
+
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read(50000)
-            self._preview_edit.setPlainText(content)
+                initial = f.read(INITIAL)
+            self._preview_edit.setPlainText(initial)
+            self._preview_chunk_pos = INITIAL
+            self._preview_chunk_total = self._preview_file_size
+            self._update_preview_progress_label()
+            QTimer.singleShot(30, self._load_next_chunk)
         except Exception as e:
             self._preview_edit.setPlainText(LM.t('preview_load_fail', error=str(e)))
+
+    def _update_preview_progress_label(self):
+        if self._preview_chunk_total > 0:
+            pct = min(100, self._preview_chunk_pos * 100 // self._preview_chunk_total)
+            self._preview_info_label.setText(
+                LM.t('preview_file_label', title=os.path.basename(self._preview_filepath),
+                     filepath=self._preview_filepath) +
+                f'  [Loading {pct}%]'
+            )
+        else:
+            self._preview_info_label.setText(
+                LM.t('preview_file_label', title=os.path.basename(self._preview_filepath),
+                     filepath=self._preview_filepath)
+            )
+
+    def _load_next_chunk(self):
+        if self._preview_chunk_pos >= self._preview_chunk_total:
+            self._update_preview_progress_label()
+            return
+        CHUNK = 100000
+        try:
+            with open(self._preview_filepath, 'r', encoding='utf-8') as f:
+                f.seek(self._preview_chunk_pos)
+                chunk = f.read(CHUNK)
+            if chunk:
+                cursor = self._preview_edit.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                cursor.insertText(chunk)
+                self._preview_chunk_pos += len(chunk)
+            self._update_preview_progress_label()
+        except Exception:
+            pass
+        if self._preview_chunk_pos < self._preview_chunk_total:
+            QTimer.singleShot(30, self._load_next_chunk)
 
     @Slot()
     def _on_open_file(self):
@@ -1112,7 +1534,387 @@ class MainWindow(QMainWindow):
         dialog.setLayout(layout)
         dialog.exec()
 
+    def _load_full_file_text(self) -> str:
+        filepath = self._composed_file
+        if not filepath or not os.path.isfile(filepath):
+            return ''
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception:
+            return ''
+
+    @Slot()
+    def _on_process(self):
+        full_text = self._load_full_file_text()
+        if not full_text:
+            QMessageBox.warning(self, LM.t('msg_title_hint'), LM.t('processor_no_file'))
+            return
+
+        self._original_full_text = full_text
+        self._proc_run_btn.setEnabled(False)
+        self._status_label.setText(LM.t('status_composing'))
+
+        kw_text = self._proc_kw_edit.text().strip()
+        keywords = [k.strip() for k in kw_text.split(';') if k.strip()] if kw_text else None
+        delete_mode = self._proc_kw_mode.currentData()
+
+        processed = NovelProcessor.process_full(
+            full_text,
+            dedup_lines=self._proc_dedup_cb.isChecked(),
+            remove_ads=self._proc_ads_cb.isChecked(),
+            smart_format=self._proc_format_cb.isChecked(),
+            layout_optimize=self._proc_layout_cb.isChecked(),
+            delete_keywords=keywords,
+            delete_mode=delete_mode,
+        )
+
+        self._processed_full_text = processed
+
+        self._preview_edit.setPlainText(processed)
+        stats = NovelProcessor.get_stats(full_text, processed)
+        self._proc_stats_label.setText(LM.t('processor_stats',
+                                             before=stats['chars_before'],
+                                             after=stats['chars_after'],
+                                             pct=stats['reduction']))
+        self._proc_undo_btn.setEnabled(True)
+        self._proc_save_btn.setEnabled(True)
+        self._proc_run_btn.setEnabled(True)
+        self._status_label.setText(LM.t('processor_done'))
+
+    @Slot()
+    def _on_save_processed(self):
+        if not self._processed_full_text:
+            return
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, LM.t('processor_save'), self._composed_file,
+            LM.t('open_txt_filter'),
+        )
+        if not filepath:
+            return
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(self._processed_full_text)
+            self._composed_file = filepath
+            self._preview_info_label.setText(
+                LM.t('preview_file_label', title='', filepath=filepath))
+            self._status_label.setText(LM.t('msg_save_settings'))
+        except Exception as e:
+            QMessageBox.critical(self, 'Error', str(e))
+
+    @Slot()
+    def _on_undo_process(self):
+        if not self._original_full_text:
+            return
+        self._preview_edit.setPlainText(self._original_full_text)
+        self._processed_full_text = ''
+        self._proc_stats_label.setText('')
+        self._proc_undo_btn.setEnabled(False)
+        self._proc_save_btn.setEnabled(False)
+        self._status_label.setText(LM.t('status_ready'))
+
+    @Slot()
+    def _on_export_epub(self):
+        filepath = self._composed_file
+        text = self._load_full_file_text()
+        if not filepath or not text:
+            QMessageBox.warning(self, LM.t('msg_title_hint'), LM.t('processor_no_file'))
+            return
+        title = os.path.splitext(os.path.basename(filepath))[0]
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, LM.t('export_epub_title'), filepath.replace('.txt', '.epub'),
+            'EPUB (*.epub)',
+        )
+        if not save_path:
+            return
+        try:
+            result = export_epub(text, save_path, title=title)
+            self._status_label.setText(LM.t('export_done', path=result))
+            QMessageBox.information(self, LM.t('processor_done'), LM.t('export_done', path=result))
+        except Exception as e:
+            QMessageBox.critical(self, 'Error', str(e))
+
+    @Slot()
+    def _on_export_html(self):
+        filepath = self._composed_file
+        text = self._load_full_file_text()
+        if not filepath or not text:
+            QMessageBox.warning(self, LM.t('msg_title_hint'), LM.t('processor_no_file'))
+            return
+        title = os.path.splitext(os.path.basename(filepath))[0]
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, LM.t('export_html_title'), filepath.replace('.txt', '.html'),
+            'HTML (*.html)',
+        )
+        if not save_path:
+            return
+        try:
+            result = export_html(text, save_path, title=title)
+            self._status_label.setText(LM.t('export_done', path=result))
+            QMessageBox.information(self, LM.t('processor_done'), LM.t('export_done', path=result))
+        except Exception as e:
+            QMessageBox.critical(self, 'Error', str(e))
+
+    def _select_chapters(self, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for i in range(self._chapter_listwidget.count()):
+            item = self._chapter_listwidget.item(i)
+            item.setCheckState(state)
+
+    @Slot()
+    def _invert_chapters(self):
+        for i in range(self._chapter_listwidget.count()):
+            item = self._chapter_listwidget.item(i)
+            new = Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked else Qt.CheckState.Checked
+            item.setCheckState(new)
+
+    @Slot()
+    def _on_add_favorite(self):
+        if not self._novel_info:
+            return
+        fav = {
+            'title': self._novel_info.title,
+            'author': self._novel_info.author,
+            'url': self._novel_info.url,
+        }
+        existing = self._config.get('favorites', [])
+        urls = {f.get('url', '') for f in existing}
+        if fav['url'] in urls:
+            QMessageBox.information(self, LM.t('msg_title_hint'), LM.t('favorite_exists'))
+            return
+        existing.insert(0, fav)
+        self._config['favorites'] = existing[:50]
+        save_config(self._config)
+        self._status_label.setText(LM.t('favorite_added'))
+        self._refresh_favorites_list()
+
+    @Slot()
+    def _on_remove_favorite(self):
+        row = self._fav_list.currentRow()
+        if row < 0:
+            return
+        existing = self._config.get('favorites', [])
+        if 0 <= row < len(existing):
+            del existing[row]
+            self._config['favorites'] = existing
+            save_config(self._config)
+            self._refresh_favorites_list()
+
+    def _refresh_favorites_list(self):
+        if not hasattr(self, '_fav_list'):
+            return
+        self._fav_list.clear()
+        for fav in self._config.get('favorites', []):
+            text = f"{fav.get('title', '')}  — {fav.get('author', '')}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, fav.get('url', ''))
+            self._fav_list.addItem(item)
+
+    @Slot()
+    def _on_open_favorite(self):
+        row = self._fav_list.currentRow()
+        if row < 0:
+            return
+        favs = self._config.get('favorites', [])
+        if 0 <= row < len(favs):
+            url = favs[row].get('url', '')
+            if url:
+                self._url_btn.setEnabled(False)
+                self._status_label.setText(LM.t('fetching_info'))
+                self._worker.fetch_novel_info(url, '')
+                self._tab_widget.setCurrentIndex(1)
+
+    def _refresh_history_combo(self):
+        if not hasattr(self, '_history_combo'):
+            return
+        self._history_combo.blockSignals(True)
+        self._history_combo.clear()
+        self._history_combo.addItem('')
+        for kw in self._config.get('search_history', [])[:20]:
+            self._history_combo.addItem(kw)
+        self._history_combo.blockSignals(False)
+
+    @Slot(str)
+    def _on_history_selected(self, text: str):
+        if text:
+            self._search_input.setText(text)
+            self._on_search()
+
+    def _refresh_bookshelf(self):
+        tag = self._bs_tag_combo.currentData()
+        items = self._bookshelf.get_items_by_tag(tag)
+        self._bs_list.clear()
+        for item in items:
+            progress_text = f'{item.read_progress:.0f}%' if item.read_progress > 0 else ''
+            display = f'{item.title}  — {item.author or "Unknown"}  [{item.file_type.upper()}]\t{progress_text}'
+            list_item = QListWidgetItem(display)
+            list_item.setData(Qt.ItemDataRole.UserRole, item.id)
+            list_item.setToolTip(
+                f"Tags: {', '.join(item.tags)}\nProgress: {item.read_progress:.1f}%\n"
+                f"Characters: {item.total_chars:,}\nAdded: {item.date_added}"
+            )
+            if item.read_progress >= 100:
+                list_item.setForeground(QColor('#a6e3a1'))
+            self._bs_list.addItem(list_item)
+
+    def _on_bs_tag_changed(self):
+        self._refresh_bookshelf()
+
+    def _on_bs_add_file(self):
+        filepaths, _ = QFileDialog.getOpenFileNames(
+            self, LM.t('bs_add_title'), '',
+            'Book files (*.txt *.epub);;Text files (*.txt);;EPUB files (*.epub);;All files (*)',
+        )
+        for fp in filepaths:
+            self._bookshelf.add_book(fp)
+        self._refresh_bookshelf()
+        if filepaths:
+            self._status_label.setText(LM.t('bs_added', count=len(filepaths)))
+
+    def _on_bs_file_dropped(self, filepath: str):
+        self._bookshelf.add_book(filepath)
+        self._refresh_bookshelf()
+        self._status_label.setText(LM.t('bs_added', count=1))
+
+    def _on_bs_remove(self):
+        selected = self._bs_list.selectedItems()
+        if not selected:
+            return
+        for item in selected:
+            item_id = item.data(Qt.ItemDataRole.UserRole)
+            self._bookshelf.remove_book(item_id)
+        self._refresh_bookshelf()
+        self._status_label.setText(LM.t('bs_removed', count=len(selected)))
+
+    def _on_bs_open(self):
+        selected = self._bs_list.selectedItems()
+        if not selected:
+            return
+        item_id = selected[0].data(Qt.ItemDataRole.UserRole)
+        book = self._bookshelf.get_book(item_id)
+        if book and os.path.isfile(book.file_path):
+            self._composed_file = book.file_path
+            self._preview_info_label.setText(LM.t('preview_file_label', title=book.title, filepath=book.file_path))
+            self._load_preview(book.file_path)
+            self._tab_widget.setCurrentIndex(2)
+
+    def _on_tts_play(self):
+        text = self._preview_edit.toPlainText()
+        if not text or len(text) < 2000:
+            full = self._load_full_file_text()
+            if full:
+                text = full
+        if not text.strip():
+            return
+        self._tts_player.speak(text)
+
+    def _on_tts_pause(self):
+        self._tts_player.toggle_pause()
+
+    def _on_tts_stop(self):
+        self._tts_player.stop()
+
+    def _on_tts_rate_changed(self, value: int):
+        self._tts_player.set_rate(value / 10.0)
+
+    def _on_tts_pitch_changed(self, value: int):
+        self._tts_player.set_pitch(value / 10.0)
+
+    def _on_tts_volume_changed(self, value: int):
+        self._tts_player.set_volume(value / 10.0)
+
+    @Slot(str)
+    def _on_tts_state_changed(self, state: str):
+        if state == TTSPlayer.STATE_PLAYING:
+            self._tts_status_label.setText(LM.t('tts_playing'))
+        elif state == TTSPlayer.STATE_PAUSED:
+            self._tts_status_label.setText(LM.t('tts_paused'))
+        elif state == TTSPlayer.STATE_STOPPED:
+            self._tts_status_label.setText(LM.t('tts_stopped_status'))
+
+    def _check_for_updates(self):
+        has_update = self._update_checker.check()
+        if has_update:
+            self._update_status_label.setText(
+                LM.t('update_available', version=self._update_checker.latest_version)
+            )
+            self._update_status_label.setStyleSheet('color: #a6e3a1;')
+            reply = QMessageBox.question(
+                self, LM.t('update_title'),
+                LM.t('update_ask', version=self._update_checker.latest_version),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._do_update()
+        else:
+            self._update_status_label.setText(
+                LM.t('update_current', version=UpdateChecker.CURRENT_VERSION)
+            )
+            self._update_status_label.setStyleSheet('color: #a6adc8;')
+
+    def _on_check_update_clicked(self):
+        self._update_check_btn.setEnabled(False)
+        self._update_status_label.setText(LM.t('update_checking'))
+        self._update_status_label.setStyleSheet('color: #f9e2af;')
+        QTimer.singleShot(500, self._check_for_updates)
+        QTimer.singleShot(2000, lambda: self._update_check_btn.setEnabled(True))
+
+    def _do_update(self):
+        self._status_label.setText(LM.t('update_downloading'))
+        tmp_path = self._update_checker.download_update(
+            callback=lambda d, t: self._update_status_label.setText(
+                LM.t('update_progress', downloaded=d, total=t)
+            )
+        )
+        if tmp_path:
+            self._update_checker.apply_update(tmp_path)
+            self._status_label.setText(LM.t('update_restarting'))
+        else:
+            self._update_status_label.setText(LM.t('update_failed'))
+            self._update_status_label.setStyleSheet('color: #f38ba8;')
+
+    def _refresh_plugins(self):
+        self._pl_list.clear()
+        for plugin in self._plugin_manager.plugins:
+            status = '✅' if plugin.enabled else '❌'
+            text = f'{status}  {plugin.name} v{plugin.version}  — {plugin.description}  [{plugin.author}]'
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, plugin.name)
+            if plugin.enabled:
+                item.setForeground(QColor('#a6e3a1'))
+            else:
+                item.setForeground(QColor('#6c7086'))
+            self._pl_list.addItem(item)
+
+    def _on_pl_install(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, LM.t('pl_install_title'), '',
+            'Python files (*.py);;All files (*)',
+        )
+        if filepath:
+            plugin = self._plugin_manager.install_plugin(filepath)
+            if plugin:
+                self._refresh_plugins()
+                self._status_label.setText(LM.t('pl_installed', name=plugin.name))
+            else:
+                QMessageBox.warning(self, LM.t('msg_title_hint'), LM.t('pl_install_fail'))
+
+    def _on_pl_remove(self):
+        selected = self._pl_list.selectedItems()
+        if not selected:
+            return
+        name = selected[0].data(Qt.ItemDataRole.UserRole)
+        if self._plugin_manager.uninstall_plugin(name):
+            self._refresh_plugins()
+            self._status_label.setText(LM.t('pl_removed', name=name))
+
+    def _on_pl_create_sample(self):
+        path = self._plugin_manager.create_sample_plugin()
+        self._status_label.setText(LM.t('pl_sample_created', path=path))
+        self._refresh_plugins()
+
     def closeEvent(self, event):
+        self._tts_player.stop()
         self._worker.cancel_all()
         QThreadPool.globalInstance().waitForDone(3000)
         super().closeEvent(event)

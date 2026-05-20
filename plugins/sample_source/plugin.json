@@ -1,0 +1,9 @@
+{
+  "name": "sample_source",
+  "description": "Sample plugin - modify source.py to add a custom novel source",
+  "version": "1.0",
+  "author": "Your Name",
+  "domain": "example.com",
+  "script": "source.py",
+  "enabled": false
+}

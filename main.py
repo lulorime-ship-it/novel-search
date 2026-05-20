@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import io
 import logging
 
 
@@ -20,28 +21,65 @@ class _StderrFilter:
         for line in lines[:-1]:
             stripped = line.strip()
             if stripped and 'libpng warning' not in stripped.lower():
-                self._real.write(line + '\n')
-                self._real.flush()
+                if self._real is not None:
+                    self._real.write(line + '\n')
+                    self._real.flush()
         return len(s)
 
     def flush(self):
         if self._buf.strip() and 'libpng warning' not in self._buf.lower():
-            self._real.write(self._buf)
+            if self._real is not None:
+                self._real.write(self._buf)
         self._buf = ''
-        self._real.flush()
+        if self._real is not None:
+            self._real.flush()
 
     def __getattr__(self, name):
-        return getattr(self._real, name)
+        if self._real is not None:
+            return getattr(self._real, name)
+        raise AttributeError(name)
 
 
 def _apply_stderr_filter():
     if not getattr(sys, 'frozen', False):
         return
     try:
-        if not isinstance(sys.stderr, _StderrFilter):
+        if sys.stderr is not None and not isinstance(sys.stderr, _StderrFilter):
             sys.stderr = _StderrFilter(sys.stderr)
+        elif sys.stderr is None:
+            sys.stderr = _StderrFilter(None)
     except Exception:
         pass
+
+
+def _setup_logging():
+    is_frozen = getattr(sys, 'frozen', False)
+    handlers = []
+    if is_frozen:
+        log_dir = _get_log_dir()
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, 'novel_search.log')
+            handlers.append(logging.FileHandler(log_file, encoding='utf-8'))
+        except Exception:
+            pass
+    console_handler = logging.StreamHandler(sys.stderr)
+    handlers.append(console_handler)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%H:%M:%S',
+        handlers=handlers,
+    )
+
+
+def _get_log_dir():
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, 'logs')
 
 
 from PySide6.QtWidgets import QApplication
@@ -50,15 +88,10 @@ from PySide6.QtCore import Qt
 from gui.main_window import MainWindow
 from gui.styles import STYLE_QSS
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%H:%M:%S',
-)
-
 
 def main():
     _apply_stderr_filter()
+    _setup_logging()
     if sys.platform == 'win32':
         try:
             import ctypes

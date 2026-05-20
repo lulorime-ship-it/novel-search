@@ -5,8 +5,9 @@ from typing import Optional
 
 from PySide6.QtCore import QThreadPool, QRunnable, Signal, QObject, Slot
 
-from sources.base import SearchResult, NovelInfo, ChapterInfo
+from sources.base import SearchResult, NovelInfo, ChapterInfo, BaseSource
 from sources.biquge import BiqugeSource, BIQUGE_DOMAINS
+from sources.generic import GenericSource
 from engine.searcher import NovelSearcher, SearchResponse
 from engine.crawler import NovelCrawler, DownloadResult
 from engine.cleaner import NovelCleaner
@@ -65,6 +66,7 @@ class NovelWorker(QObject):
     redownload_finished = Signal(list, list)
     download_error = Signal(str)
     download_cancelled = Signal()
+    checkpoint_available = Signal(int, int, int)
 
     compose_finished = Signal(str, str)
     compose_error = Signal(str)
@@ -79,9 +81,11 @@ class NovelWorker(QObject):
         self._searcher = NovelSearcher()
         self._crawler: Optional[NovelCrawler] = None
         self._composer = NovelComposer()
-        self._current_source: Optional[BiqugeSource] = None
+        self._current_source: Optional[BaseSource] = None
         self._cancelled = False
         self._active_tasks: list[_AsyncTask] = []
+        self._novel_title: str = ''
+        self._output_dir: str = 'downloads'
 
     @classmethod
     def instance(cls) -> 'NovelWorker':
@@ -139,7 +143,18 @@ class NovelWorker(QObject):
         if not source_name:
             source_name = self._guess_source_name(base_url)
 
-        source = BiqugeSource(source_name=source_name, base_url=base_url)
+        is_biquge = any(
+            name in base_url or domain_url in base_url
+            for name, domain_url in BIQUGE_DOMAINS
+        )
+
+        if is_biquge:
+            source = BiqugeSource(source_name=source_name, base_url=base_url)
+            self._emit_log(f'使用笔趣阁适配器: {source_name}')
+        else:
+            source = GenericSource()
+            self._emit_log(f'使用通用适配器解析: {base_url}')
+
         self._current_source = source
         self._crawler = NovelCrawler(source=source, concurrency=5, delay=0.5)
 
@@ -164,6 +179,7 @@ class NovelWorker(QObject):
 
     def _on_info_done(self, info: Optional[NovelInfo]):
         if info:
+            self._novel_title = info.title
             self._emit_log(f'获取成功: 《{info.title}》共 {len(info.chapters)} 章')
             self.novel_info_ready.emit(info)
         else:
@@ -178,19 +194,34 @@ class NovelWorker(QObject):
             f'错误: {error}'
         )
 
-    def download_chapters(self, chapters: list[ChapterInfo]):
+    def download_chapters(self, chapters: list[ChapterInfo], output_dir: str = 'downloads'):
         if not self._crawler:
             self._emit_log('错误: 未初始化爬虫')
             self.download_error.emit('未初始化爬虫，请先获取小说目录')
             return
         self._cancelled = False
-        self._emit_log(f'开始下载 {len(chapters)} 个章节...')
+        self._output_dir = output_dir
+
+        if self._novel_title:
+            self._crawler.init_checkpoint(self._novel_title, output_dir)
+
+        cached = self._crawler.get_cached_chapters() if self._novel_title else []
+        cached_indices = {ch.index for ch, _ in cached}
+        pending = [ch for ch in chapters if ch.index not in cached_indices]
+
+        total = len(chapters)
+        if cached:
+            done, failed, pending_count = self._crawler.get_checkpoint_summary()
+            self.checkpoint_available.emit(done, failed, pending_count)
+            self._emit_log(f'发现断点缓存: {done}章已完成, {pending_count}章待下载 (共{total}章)')
+        self._emit_log(f'开始下载 {len(pending)}/{total} 章 (已缓存 {len(cached)} 章)...')
 
         async def _download_all():
             def _progress(completed, total, title):
                 if not self._cancelled:
                     self.download_progress.emit(completed, total, title)
                     if completed % 10 == 0:
+
                         self._emit_log(f'下载进度: {completed}/{total}')
 
             return await self._crawler.download_all_chapters(
@@ -272,7 +303,9 @@ class NovelWorker(QObject):
         self._composer._output_dir = Path(output_dir)
 
         async def _compose():
-            return self._composer.compose(title, author, chapters_data, intro)
+            filepath = self._composer.compose(title, author, chapters_data, intro)
+            self._composer.save_individual_chapters(title, chapters_data)
+            return filepath
 
         self._launch(
             _compose,
